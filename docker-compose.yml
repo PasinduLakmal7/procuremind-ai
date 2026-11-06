@@ -1,0 +1,309 @@
+networks:
+  procurement-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  redis_data:
+  minio_data:
+
+services:
+  # ==========================================
+  # Edge Gateway: Traefik
+  # ==========================================
+  gateway:
+    image: traefik:v3.0
+    container_name: procurement-gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./gateway/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./gateway/traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
+    networks:
+      - procurement-network
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ==========================================
+  # Storage & Messaging Middleware
+  # ==========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: procurement-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_MULTIPLE_DATABASES: identity_db,procurement_db,supplier_db,document_db,ai_orchestrator_db,risk_db,optimization_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init-multiple-databases.sh:/docker-entrypoint-initdb.d/init-multiple-databases.sh:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - procurement-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: procurement-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - procurement-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: procurement-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - procurement-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  minio:
+    image: pgsty/silo:latest
+    container_name: procurement-minio
+    restart: unless-stopped
+    entrypoint: >
+      /bin/sh -c "mkdir -p /data/procurement-quotations && exec silo server /data --console-address ':9001'"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    networks:
+      - procurement-network
+    healthcheck:
+      test: ["CMD", "silo", "healthcheck", "live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==========================================
+  # FastAPI Microservices
+  # ==========================================
+  identity-service:
+    build:
+      context: .
+      dockerfile: services/identity-service/Dockerfile
+    container_name: procurement-identity-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_NAME: identity-service
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/identity_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-default-insecure-stage1-jwt-secret-key-32-chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.identity.rule=PathPrefix(`/api/v1/identity`)"
+      - "traefik.http.routers.identity.entrypoints=web"
+      - "traefik.http.services.identity.loadbalancer.server.port=8001"
+    networks:
+      - procurement-network
+
+  procurement-service:
+    build:
+      context: .
+      dockerfile: services/procurement-service/Dockerfile
+    container_name: procurement-procurement-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_NAME: procurement-service
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/procurement_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-default-insecure-stage1-jwt-secret-key-32-chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.procurement.rule=PathPrefix(`/api/v1/procurement`)"
+      - "traefik.http.routers.procurement.entrypoints=web"
+      - "traefik.http.services.procurement.loadbalancer.server.port=8002"
+    networks:
+      - procurement-network
+
+  supplier-service:
+    build:
+      context: .
+      dockerfile: services/supplier-service/Dockerfile
+    container_name: procurement-supplier-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_NAME: supplier-service
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/supplier_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-default-insecure-stage1-jwt-secret-key-32-chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.supplier.rule=PathPrefix(`/api/v1/supplier`)"
+      - "traefik.http.routers.supplier.entrypoints=web"
+      - "traefik.http.services.supplier.loadbalancer.server.port=8003"
+    networks:
+      - procurement-network
+
+  document-service:
+    build:
+      context: .
+      dockerfile: services/document-service/Dockerfile
+    container_name: procurement-document-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      APP_NAME: document-service
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-default-insecure-stage1-jwt-secret-key-32-chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.document.rule=PathPrefix(`/api/v1/document`)"
+      - "traefik.http.routers.document.entrypoints=web"
+      - "traefik.http.services.document.loadbalancer.server.port=8004"
+    networks:
+      - procurement-network
+
+  ai-orchestrator-service:
+    build:
+      context: .
+      dockerfile: services/ai-orchestrator-service/Dockerfile
+    container_name: procurement-ai-orchestrator-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_NAME: ai-orchestrator-service
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/ai_orchestrator_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-default-insecure-stage1-jwt-secret-key-32-chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ai-orchestrator.rule=PathPrefix(`/api/v1/ai-orchestrator`)"
+      - "traefik.http.routers.ai-orchestrator.entrypoints=web"
+      - "traefik.http.services.ai-orchestrator.loadbalancer.server.port=8005"
+    networks:
+      - procurement-network
+
+  risk-service:
+    build:
+      context: .
+      dockerfile: services/risk-service/Dockerfile
+    container_name: procurement-risk-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_NAME: risk-service
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/risk_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-default-insecure-stage1-jwt-secret-key-32-chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.risk.rule=PathPrefix(`/api/v1/risk`)"
+      - "traefik.http.routers.risk.entrypoints=web"
+      - "traefik.http.services.risk.loadbalancer.server.port=8006"
+    networks:
+      - procurement-network
+
+  optimization-service:
+    build:
+      context: .
+      dockerfile: services/optimization-service/Dockerfile
+    container_name: procurement-optimization-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_NAME: optimization-service
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/optimization_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-default-insecure-stage1-jwt-secret-key-32-chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.optimization.rule=PathPrefix(`/api/v1/optimization`)"
+      - "traefik.http.routers.optimization.entrypoints=web"
+      - "traefik.http.services.optimization.loadbalancer.server.port=8007"
+    networks:
+      - procurement-network
+
+  # ==========================================
+  # Celery Asynchronous Workers
+  # ==========================================
+  document-worker:
+    build:
+      context: .
+      dockerfile: workers/document-worker/Dockerfile
+    container_name: procurement-document-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_db
+    networks:
+      - procurement-network
+
+  # ==========================================
+  # React Frontend Dashboard
+  # ==========================================
+  frontend:
+    build:
+      context: ./frontend/procurement-dashboard
+      dockerfile: Dockerfile
+    container_name: procurement-frontend
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.entrypoints=web"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+    networks:
+      - procurement-network
+
+

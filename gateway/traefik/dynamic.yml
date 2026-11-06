@@ -1,0 +1,121 @@
+# Traefik Dynamic Configuration
+http:
+  middlewares:
+    secHeaders:
+      headers:
+        sslRedirect: false
+        browserXssFilter: true
+        contentTypeNosniff: true
+        forceSTSHeader: false
+        frameDeny: true
+
+    rateLimitAuth:
+      rateLimit:
+        average: 20
+        burst: 50
+        period: 1m
+
+  routers:
+    identity-router:
+      rule: "PathPrefix(`/api/v1/identity`)"
+      entryPoints:
+        - web
+      service: identity-svc
+      middlewares:
+        - secHeaders
+
+    procurement-router:
+      rule: "PathPrefix(`/api/v1/procurement`)"
+      entryPoints:
+        - web
+      service: procurement-svc
+      middlewares:
+        - secHeaders
+
+    supplier-router:
+      rule: "PathPrefix(`/api/v1/supplier`)"
+      entryPoints:
+        - web
+      service: supplier-svc
+      middlewares:
+        - secHeaders
+
+    document-router:
+      rule: "PathPrefix(`/api/v1/document`)"
+      entryPoints:
+        - web
+      service: document-svc
+      middlewares:
+        - secHeaders
+
+    ai-orchestrator-router:
+      rule: "PathPrefix(`/api/v1/ai-orchestrator`)"
+      entryPoints:
+        - web
+      service: ai-orchestrator-svc
+      middlewares:
+        - secHeaders
+
+    risk-router:
+      rule: "PathPrefix(`/api/v1/risk`)"
+      entryPoints:
+        - web
+      service: risk-svc
+      middlewares:
+        - secHeaders
+
+    optimization-router:
+      rule: "PathPrefix(`/api/v1/optimization`)"
+      entryPoints:
+        - web
+      service: optimization-svc
+      middlewares:
+        - secHeaders
+
+    frontend-router:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - web
+      priority: 1
+      service: frontend-svc
+
+  services:
+    identity-svc:
+      loadBalancer:
+        servers:
+          - url: "http://identity-service:8001"
+
+    procurement-svc:
+      loadBalancer:
+        servers:
+          - url: "http://procurement-service:8002"
+
+    supplier-svc:
+      loadBalancer:
+        servers:
+          - url: "http://supplier-service:8003"
+
+    document-svc:
+      loadBalancer:
+        servers:
+          - url: "http://document-service:8004"
+
+    ai-orchestrator-svc:
+      loadBalancer:
+        servers:
+          - url: "http://ai-orchestrator-service:8005"
+
+    risk-svc:
+      loadBalancer:
+        servers:
+          - url: "http://risk-service:8006"
+
+    optimization-svc:
+      loadBalancer:
+        servers:
+          - url: "http://optimization-service:8007"
+
+    frontend-svc:
+      loadBalancer:
+        servers:
+          - url: "http://frontend:80"
